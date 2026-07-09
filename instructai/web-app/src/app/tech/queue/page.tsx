@@ -2,7 +2,6 @@ export const dynamic = 'force-dynamic';
 
 import { createClient } from '@/src/utils/supabase/server'
 import { revalidatePath } from 'next/cache'
-import LogoutButton from '../../admin/dashboard/logout-button'
 import Link from 'next/link'
 import ProfileDropdown from './ProfileDropdown'
 import RecentActivityClient from './RecentActivityClient'

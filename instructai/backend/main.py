@@ -29,30 +29,54 @@ app.add_middleware(
 # ==========================================
 
 SETUP_PROMPT = """
+You are ARIA, an expert IT field-setup assistant on a live audio/video call with a technician installing new equipment.
 
+RULES:
+- Give ONE clear instruction or ask ONE question per turn — never more.
+- Always reference what you can actually see in the frame: "I can see the power LED is solid green."
+- Build on previous turns — never repeat a step that's already done.
+- Keep every response under 35 words. The technician is busy and wearing an earpiece.
+- If the technician speaks, acknowledge it first ("Got it," "Looks good") before continuing.
+- End every response with one clear next action: "Now connect the WAN cable to the blue port."
+
+SETUP FLOW (move forward, never loop back):
+1. Confirm the device is powered and the boot LEDs are normal.
+2. Guide the physical cabling (WAN/fiber in, LAN out) one cable at a time.
+3. Walk through the admin portal / app activation on their screen.
+4. Verify connectivity with a speed test, confirm success, and clear them to finish.
+
+Do NOT give generic advice. Every response must be grounded in the current frame.
 """
 
 DIAGNOSTIC_PROMPT = """
-You are a highly skilled Senior Network Engineer remotely assisting a field technician via a live video and audio feed. 
+You are ARIA, an expert IT diagnostic assistant on a live audio/video call with a field technician. You are LEADING a structured fault-finding session — you drive the conversation, the technician follows.
 
-Your goal is to be a dynamic, conversational, and highly adaptive collaborator. You must actively look at the camera feed, answer questions naturally, and provide real-time solutions.
+RULES:
+- Ask ONE question or give ONE instruction per turn — never more.
+- Always reference what you can actually see in the frame: "I can see the WAN LED is off."
+- Build on previous turns — never repeat yourself and never re-check a step we already verified.
+- Distinguish what you SEE vs what you SUSPECT vs what you need CONFIRMED.
+- Keep every response under 35 words. The technician is busy and wearing an earpiece.
+- If the technician speaks, acknowledge it first ("Got it," "Looks good") before continuing.
+- End every response with one clear next action: "Can you tilt the camera toward the back panel?"
 
-CRITICAL COMMUNICATION RULES:
-1. BE CONVERSATIONAL & CONCISE: Keep your responses to 1 or 2 short sentences. Stop talking frequently so the technician can respond.
-2. ALWAYS ACKNOWLEDGE: Whenever the technician completes a step or shows you a verified frame, start your response with a quick, positive acknowledgement (e.g., "Got it," "Looks good," or "Task confirmed").
-3. STATE TRACKING & MEMORY (CRITICAL): You must remember the conversation history! NEVER ask the technician to repeat a step or check something we have already verified. Once a step is complete, lock it in your memory and ONLY move forward. Do not loop back to the beginning.
-4. VERIFY VIA VIDEO: Always use the live video feed to confirm hardware states before giving the next step.
+TROUBLESHOOTING FLOW (move forward sequentially, never loop back):
+1. Power & LEDs: have the tech show the router's front panel.
+   - RED optical/WAN light → physical fiber issue; have them trace the fiber cable.
+   - Wi-Fi lights OFF → have them press the physical Wi-Fi button.
+   - ALL lights GREEN → acknowledge the healthy link and skip straight to step 4.
+2. Cable check (only if LEDs show a physical failure): inspect the Ethernet and fiber connections.
+3. Logic check (connected but no internet): view the router admin portal to check IP allocation.
+4. Verify: run a speed test, confirm the result on screen, then clear them to pack up.
 
-TROUBLESHOOTING FRAMEWORK (Move sequentially, do not go backwards):
-- Step 1: Power & LEDs. Ask the tech to show you the router's front panel lights. 
-    - If you see a RED optical/WAN light: It's a physical issue. Have them trace the fiber cable.
-    - If Wi-Fi lights are OFF: Have them press the physical Wi-Fi button.
-    - If ALL lights are GREEN/NORMAL: Acknowledge the healthy connection and SKIP STRAIGHT TO STEP 4 (Speed Test).
-- Step 2: Cable Check (Only if lights indicate a physical failure): Ask to see the physical Ethernet and fiber connections.
-- Step 3: Logic Check (If they are connected to Wi-Fi but have no internet): Ask to see the router's admin portal on their screen to check the IP allocation.
-- Step 4: Verification. Once fixed or if lights were initially green, ask them to run a speed test on their device. Confirm the telemetry on their screen, acknowledge the job is complete, and clear them to pack up.
+Do NOT give generic advice. Every response must be grounded in the current frame.
+When the technician says "Verify" or presses the button, analyze the new frame in the context of the CURRENT step only, acknowledge what you see, and move forward.
+"""
 
-Remember: When the technician says "Verify" or presses the button, analyze the new frame strictly in the context of our CURRENT step, acknowledge what you see, and move the troubleshooting process forward.
+WAKE_UP_PROMPT = """
+You are now connected to a live technician on-site, and their camera feed is streaming to you.
+Briefly introduce yourself as ARIA in one sentence, confirm what equipment you can actually see in the frame, and ask your FIRST focused diagnostic question based on what you observe.
+Keep it under 35 words.
 """
 
 # Initialize Gemini Client
@@ -86,7 +110,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str = None, job_ty
     # THE INFINITE LOOP: Keeps the server alive even if Gemini drops
     while True:
         try:
-            # We configure the AI with the Network Engineer Persona and Voice
+            # We configure the AI with the Network Engineer Persona and Voice.
+            # Transcription is enabled for BOTH sides so the frontend can render
+            # a live conversation transcript alongside the audio.
             config = types.LiveConnectConfig(
                 response_modalities=["AUDIO"],
                 speech_config=types.SpeechConfig(
@@ -96,6 +122,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str = None, job_ty
                         )
                     )
                 ),
+                output_audio_transcription=types.AudioTranscriptionConfig(),
+                input_audio_transcription=types.AudioTranscriptionConfig(),
                 system_instruction=types.Content(
                     parts=[types.Part.from_text(text=active_prompt)]
                 )
@@ -119,15 +147,14 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str = None, job_ty
                                 if not first_frame_received:
                                     print("Backend: First frame received! Sending wake-up prompt + image...")
                                     
-                                    # Modern SDK: Send the text trigger directly
-                                    await session.send_realtime_input(
-                                        text="Hello! I am on-site and starting the network audit. I am sharing my live camera feed. Please confirm what you see and tell me our first diagnostic step."
-                                    )
-                                    
-                                    # Modern SDK: Send the video frame as a pure Blob (No "Part" wrapping)
+                                    # Send the video frame FIRST so ARIA has something to look at
+                                    # when it processes the wake-up instruction (No "Part" wrapping).
                                     await session.send_realtime_input(
                                         video=types.Blob(data=raw_bytes, mime_type="image/jpeg")
                                     )
+                                    
+                                    # Then trigger ARIA to introduce itself and lead the first step
+                                    await session.send_realtime_input(text=WAKE_UP_PROMPT)
                                     
                                     first_frame_received = True
                                 else:
@@ -176,6 +203,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str = None, job_ty
 
                 async def receive_from_google():
                     pcm_buffer = bytearray() 
+                    aria_transcript = ""   # ARIA's spoken words (output transcription)
+                    tech_transcript = ""   # Technician's spoken words (input transcription)
                     
                     async for response in session.receive():
                         server_content = response.server_content
@@ -184,8 +213,17 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str = None, job_ty
                             if getattr(server_content, 'interrupted', False):
                                 print("Backend: AI was interrupted by the user! Sending kill switch...")
                                 pcm_buffer.clear()
+                                aria_transcript = ""
                                 await websocket.send_text(json.dumps({"type": "interrupt"}))
                                 continue # Skip the rest of this loop and wait for the new response
+
+                            # Accumulate live transcripts (they arrive in small fragments)
+                            input_tx = getattr(server_content, 'input_transcription', None)
+                            if input_tx is not None and getattr(input_tx, 'text', None):
+                                tech_transcript += input_tx.text
+                            output_tx = getattr(server_content, 'output_transcription', None)
+                            if output_tx is not None and getattr(output_tx, 'text', None):
+                                aria_transcript += output_tx.text
                             
                             # Catch audio as it comes in
                             model_turn = server_content.model_turn
@@ -213,23 +251,41 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str = None, job_ty
                                             pcm_buffer.clear()
 
                             # THE FLUSH COMMAND: If AI is done talking, send whatever is left in the bucket!
-                            if server_content.turn_complete and len(pcm_buffer) > 0:
-                                print("Backend: AI finished sentence. Flushing remaining audio to phone...")
-                                wav_io = io.BytesIO()
-                                with wave.open(wav_io, 'wb') as wav_file:
-                                    wav_file.setnchannels(1)
-                                    wav_file.setsampwidth(2)
-                                    wav_file.setframerate(24000)
-                                    wav_file.writeframes(pcm_buffer)
+                            if server_content.turn_complete:
+                                if len(pcm_buffer) > 0:
+                                    print("Backend: AI finished sentence. Flushing remaining audio to phone...")
+                                    wav_io = io.BytesIO()
+                                    with wave.open(wav_io, 'wb') as wav_file:
+                                        wav_file.setnchannels(1)
+                                        wav_file.setsampwidth(2)
+                                        wav_file.setframerate(24000)
+                                        wav_file.writeframes(pcm_buffer)
+                                        
+                                    wav_data = wav_io.getvalue()
+                                    base64_audio = base64.b64encode(wav_data).decode("utf-8")
                                     
-                                wav_data = wav_io.getvalue()
-                                base64_audio = base64.b64encode(wav_data).decode("utf-8")
-                                
-                                await websocket.send_text(json.dumps({
-                                    "type": "audio",
-                                    "data": base64_audio
-                                }))
-                                pcm_buffer.clear()
+                                    await websocket.send_text(json.dumps({
+                                        "type": "audio",
+                                        "data": base64_audio
+                                    }))
+                                    pcm_buffer.clear()
+
+                                # Flush the completed transcripts for this turn.
+                                # Technician first (what they said), then ARIA's reply.
+                                if tech_transcript.strip():
+                                    await websocket.send_text(json.dumps({
+                                        "type": "transcript",
+                                        "role": "tech",
+                                        "text": tech_transcript.strip()
+                                    }))
+                                    tech_transcript = ""
+                                if aria_transcript.strip():
+                                    await websocket.send_text(json.dumps({
+                                        "type": "transcript",
+                                        "role": "aria",
+                                        "text": aria_transcript.strip()
+                                    }))
+                                    aria_transcript = ""
 
                 task_a = asyncio.create_task(receive_from_phone())
                 task_b = asyncio.create_task(receive_from_google())

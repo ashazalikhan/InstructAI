@@ -19,9 +19,31 @@ export default function TechnicianWorkspace({ params }: { params: Promise<{ jobI
   const [isPaused, setIsPaused] = useState(false);
   const isPausedRef = useRef(isPaused);
 
+  // Job context for the header label
+  const [jobType, setJobType] = useState<string>("Diagnostic");
+
+  // Conversation transcript + ARIA's current spoken message
+  type ChatMessage = { role: "tech" | "aria"; text: string };
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [currentAriaMessage, setCurrentAriaMessage] = useState<string>("");
+  const transcriptEndRef = useRef<HTMLDivElement>(null);
+
+  // Push-to-talk: mic audio is only streamed while the technician holds the button
+  const [isHolding, setIsHolding] = useState(false);
+  const isHoldingRef = useRef(isHolding);
+
   useEffect(() => {
     isPausedRef.current = isPaused;
   }, [isPaused]);
+
+  useEffect(() => {
+    isHoldingRef.current = isHolding;
+  }, [isHolding]);
+
+  // Auto-scroll the transcript to the newest message
+  useEffect(() => {
+    transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
   // Audio playback queue
   const audioQueue = useRef<HTMLAudioElement[]>([]);
@@ -55,6 +77,10 @@ export default function TechnicianWorkspace({ params }: { params: Promise<{ jobI
         .eq('id', jobId)
         .single();
 
+      if (jobData?.job_type) {
+        setJobType(jobData.job_type);
+      }
+
       // 1. Check if Apple is hiding the Camera API entirely (Usually an HTTP vs HTTPS issue)
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         alert("🚨 SECURITY BLOCK: Safari hid the camera API. Check that your URL starts with 'https://'");
@@ -79,12 +105,13 @@ export default function TechnicianWorkspace({ params }: { params: Promise<{ jobI
 
       setIsCameraStarted(true);
 
-      // Setup WebSocket
-      let wsUrl = "wss://pretense-citable-uncut.ngrok-free.dev/ws";
+      // Setup WebSocket. The backend URL comes from NEXT_PUBLIC_BACKEND_WS_URL so it
+      // can be configured per environment (Vercel/local/tunnel) without code changes.
+      let wsUrl = process.env.NEXT_PUBLIC_BACKEND_WS_URL || "wss://pretense-citable-uncut.ngrok-free.dev/ws";
       if (jobData?.job_type) {
         wsUrl += `?job_type=${encodeURIComponent(jobData.job_type)}`;
       }
-      
+
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
@@ -92,7 +119,7 @@ export default function TechnicianWorkspace({ params }: { params: Promise<{ jobI
         setStatus("AI Online");
 
         // Set up audio capture using AudioContext and AudioWorklet
-        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+        const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
         if (AudioContextClass) {
           const setupAudioWorklet = async () => {
             const audioCtx = new AudioContextClass({ sampleRate: 16000 });
@@ -110,11 +137,13 @@ export default function TechnicianWorkspace({ params }: { params: Promise<{ jobI
 
             workletNode.port.onmessage = (event) => {
               if (isPausedRef.current) return;
+              // Push-to-talk: only stream mic audio while the technician holds the button
+              if (!isHoldingRef.current) return;
               if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
                 const inputData = event.data;
                 const pcmData = new Int16Array(inputData.length);
                 for (let i = 0; i < inputData.length; i++) {
-                  let s = Math.max(-1, Math.min(1, inputData[i]));
+                  const s = Math.max(-1, Math.min(1, inputData[i]));
                   pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
                 }
                 const buffer = new Uint8Array(pcmData.buffer);
@@ -147,6 +176,14 @@ export default function TechnicianWorkspace({ params }: { params: Promise<{ jobI
           if (message.type === "audio" && message.data) {
             playAudio(message.data);
           }
+          // Live conversation transcript (both technician and ARIA)
+          else if (message.type === "transcript" && message.text) {
+            const role: "tech" | "aria" = message.role === "tech" ? "tech" : "aria";
+            setMessages((prev) => [...prev, { role, text: message.text }]);
+            if (role === "aria") {
+              setCurrentAriaMessage(message.text);
+            }
+          }
           // THE KILL SWITCH: If the AI hears you, empty the queue and stop playing!
           else if (message.type === "interrupt") {
             console.log("User interrupted! Clearing audio queue...");
@@ -162,41 +199,17 @@ export default function TechnicianWorkspace({ params }: { params: Promise<{ jobI
         }
       };
 
-      // ... (keep your ws.onerror and ws.onclose the same) ...
-
-      const playNextAudio = () => {
-        if (isPlaying.current || audioQueue.current.length === 0) return;
-
-        isPlaying.current = true;
-        const audio = audioQueue.current.shift();
-        if (audio) {
-          currentAudioRef.current = audio; // Track the current playing audio
-
-          audio.onended = () => {
-            currentAudioRef.current = null;
-            isPlaying.current = false;
-            playNextAudio();
-          };
-
-          audio.play().catch(e => {
-            console.warn(`Audio chunk skipped: ${e.name}`);
-            currentAudioRef.current = null;
-            isPlaying.current = false;
-            playNextAudio();
-          });
-        }
-      };
-
       ws.onerror = () => setStatus("Error");
       ws.onclose = () => {
         setStatus("Disconnected");
         if (intervalIdRef.current) clearInterval(intervalIdRef.current);
       };
 
-    } catch (err: any) {
+    } catch (err) {
       console.error("Error accessing media devices.", err);
       // THIS IS THE MAGIC LINE: It forces the phone to show us the error!
-      alert(`🚨 CAMERA ERROR: ${err.name} - ${err.message}`);
+      const e = err as Error;
+      alert(`🚨 CAMERA ERROR: ${e.name} - ${e.message}`);
       setStatus("Error");
     }
   };
@@ -247,13 +260,16 @@ export default function TechnicianWorkspace({ params }: { params: Promise<{ jobI
     isPlaying.current = true;
     const audio = audioQueue.current.shift();
     if (audio) {
+      currentAudioRef.current = audio; // Track the playing chunk so pause/interrupt can stop it
       audio.onended = () => {
+        currentAudioRef.current = null;
         isPlaying.current = false;
         playNextAudio();
       };
       // THE FIX: We catch the error quietly so Next.js ignores it.
       audio.play().catch(e => {
         console.warn(`Audio chunk skipped: ${e.name}`);
+        currentAudioRef.current = null;
         isPlaying.current = false;
         playNextAudio();
       });
@@ -285,6 +301,21 @@ export default function TechnicianWorkspace({ params }: { params: Promise<{ jobI
         isPlaying.current = false;
       }
     }
+  };
+
+  // --- PUSH-TO-TALK ---
+  // Mic audio only streams to the backend while the button is held down.
+  const startTalking = () => {
+    if (isPaused) return;
+    // Resume the AudioContext in case the browser suspended it (mobile autoplay policy)
+    if (audioCtxRef.current && audioCtxRef.current.state === "suspended") {
+      audioCtxRef.current.resume().catch(() => {});
+    }
+    setIsHolding(true);
+  };
+
+  const stopTalking = () => {
+    setIsHolding(false);
   };
 
   const handleManualVerify = () => {
@@ -322,11 +353,13 @@ export default function TechnicianWorkspace({ params }: { params: Promise<{ jobI
   };
 
   return (
-    <div className="w-full h-screen bg-gray-50 flex flex-col overflow-hidden">
+    <div className="w-full h-screen bg-[#0a0e1a] flex flex-col overflow-hidden text-white">
       <canvas ref={canvasRef} className="hidden" />
 
-      {/* Top Section: The Camera */}
-      <div className="relative w-full h-[55%] bg-black rounded-b-[40px] overflow-hidden shadow-xl shrink-0">
+      {/* ============================================================
+          ZONE 1 — CAMERA (full-bleed scanning tool)
+      ============================================================ */}
+      <div className="relative w-full h-[42%] bg-gradient-to-b from-[#0f1629] to-[#0a0e1a] overflow-hidden shrink-0">
         <video
           ref={videoRef}
           autoPlay
@@ -335,17 +368,42 @@ export default function TechnicianWorkspace({ params }: { params: Promise<{ jobI
           className="w-full h-full object-cover"
         />
 
-        {/* Start Camera Overlay (Frosted Glass) */}
-        {!isCameraStarted && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/60 backdrop-blur-md z-50">
-            <div className="w-20 h-20 bg-indigo-100 rounded-full flex items-center justify-center mb-6 animate-pulse shadow-sm">
-              <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z" /><circle cx="12" cy="13" r="3" /></svg>
+        {/* LIVE badge + job label */}
+        {isCameraStarted && (
+          <>
+            <div className="absolute top-4 left-4 z-20 flex items-center gap-2 bg-red-600 px-3 py-1.5 rounded-full shadow-lg">
+              <span className="w-2 h-2 rounded-full bg-white animate-pulse"></span>
+              <span className="text-xs font-bold uppercase tracking-wider">Live</span>
             </div>
-            <h2 className="text-gray-900 text-2xl font-bold mb-2">Ready to Inspect</h2>
-            <p className="text-gray-600 mb-8 text-center max-w-xs font-medium">Tap below to activate your camera and connect to the AI Auditor.</p>
+            <div className="absolute top-4 right-4 z-20 text-right">
+              <p className="text-xs font-semibold text-white/90">Job #{jobId.slice(0, 4).toUpperCase()}</p>
+              <p className="text-[10px] uppercase tracking-wide text-white/50">{jobType}</p>
+            </div>
+
+            {/* Scan-corner brackets */}
+            <div className="pointer-events-none absolute inset-6 z-10">
+              <span className="absolute top-0 left-0 w-8 h-8 border-t-2 border-l-2 border-white/40 rounded-tl-lg"></span>
+              <span className="absolute top-0 right-0 w-8 h-8 border-t-2 border-r-2 border-white/40 rounded-tr-lg"></span>
+              <span className="absolute bottom-0 left-0 w-8 h-8 border-b-2 border-l-2 border-white/40 rounded-bl-lg"></span>
+              <span className="absolute bottom-0 right-0 w-8 h-8 border-b-2 border-r-2 border-white/40 rounded-br-lg"></span>
+              <span className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-white/20 text-xs font-medium tracking-widest uppercase">
+                {status === 'AI Online' ? '' : 'Camera feed'}
+              </span>
+            </div>
+          </>
+        )}
+
+        {/* Start Camera Overlay */}
+        {!isCameraStarted && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#0a0e1a]/80 backdrop-blur-md z-50">
+            <div className="w-20 h-20 bg-indigo-500/20 rounded-full flex items-center justify-center mb-6 animate-pulse ring-1 ring-indigo-400/30">
+              <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#818cf8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z" /><circle cx="12" cy="13" r="3" /></svg>
+            </div>
+            <h2 className="text-white text-2xl font-bold mb-2">Ready to Inspect</h2>
+            <p className="text-white/60 mb-8 text-center max-w-xs font-medium">Tap below to activate your camera and connect to ARIA.</p>
             <button
               onClick={startCameraAndAudio}
-              className="touch-manipulation bg-indigo-600 hover:bg-indigo-700 text-white px-8 py-4 rounded-full text-xl font-bold shadow-lg transition-all active:scale-95"
+              className="touch-manipulation bg-indigo-600 hover:bg-indigo-500 text-white px-8 py-4 rounded-full text-xl font-bold shadow-lg shadow-indigo-900/40 transition-all active:scale-95"
             >
               Start AI Audit
             </button>
@@ -353,97 +411,122 @@ export default function TechnicianWorkspace({ params }: { params: Promise<{ jobI
         )}
       </div>
 
-      {/* Bottom Section: The Control Card */}
-      <div className="flex-grow bg-gray-50 flex flex-col px-6 pt-6 pb-8">
-        <div className="bg-white rounded-3xl p-6 shadow-sm flex flex-col h-full justify-between">
-          
-          <div className="flex flex-col gap-6">
-            {/* Status Header */}
-            <div className="flex justify-center w-full">
-              <div className={`px-4 py-2 rounded-full flex items-center border shadow-sm w-full justify-center ${
-                status === 'AI Online' ? 'bg-green-50 border-green-200 text-green-700' :
-                status === 'Connecting...' ? 'bg-yellow-50 border-yellow-200 text-yellow-700' :
-                status === 'Waiting for Camera' ? 'bg-blue-50 border-blue-200 text-blue-700' : 'bg-red-50 border-red-200 text-red-700'
-              }`}>
-                <span className={`w-2.5 h-2.5 rounded-full mr-2.5 ${
-                  status === 'AI Online' ? 'bg-green-500 animate-pulse' :
-                  status === 'Connecting...' ? 'bg-yellow-500 animate-bounce' :
-                  status === 'Waiting for Camera' ? 'bg-blue-500' : 'bg-red-500'
-                }`}></span>
-                <span className="text-sm font-bold uppercase tracking-wide">{status}</span>
-              </div>
-            </div>
+      {/* ============================================================
+          ZONES 2-4 — ARIA panel, transcript, actions
+      ============================================================ */}
+      <div className="flex-grow flex flex-col min-h-0 px-4 pt-4 pb-5 gap-3">
 
-            {/* Audio Feedback UI */}
-            <div className="bg-indigo-50 rounded-2xl p-4 flex items-center justify-between border border-indigo-100">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 bg-white rounded-full flex items-center justify-center shadow-sm">
-                  <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
-                </div>
-                <div>
-                  <p className="text-indigo-900 font-bold text-sm">AI Auditor</p>
-                  <p className="text-indigo-600/80 text-xs font-medium">
-                    {status === 'AI Online' ? 'Listening & Analyzing...' : 'Standby'}
-                  </p>
+        {/* ZONE 2 — ARIA current message + directional cue */}
+        <div className="bg-indigo-500/10 border border-indigo-400/20 rounded-2xl p-4 shrink-0">
+          <div className="flex items-center gap-2 mb-2">
+            <span className={`w-2 h-2 rounded-full ${status === 'AI Online' ? 'bg-indigo-400 animate-pulse' : 'bg-white/30'}`}></span>
+            <span className="text-xs font-bold uppercase tracking-wider text-indigo-300">
+              ARIA {status === 'AI Online' ? '· Speaking' : '· Standby'}
+            </span>
+          </div>
+          <p className="text-[15px] leading-snug font-medium text-white">
+            {currentAriaMessage || (status === 'AI Online'
+              ? 'Listening… show me the equipment and I\'ll guide you.'
+              : 'Start the audit to connect with ARIA.')}
+          </p>
+        </div>
+
+        {/* ZONE 3 — Conversation transcript */}
+        <div className="flex-grow min-h-0 flex flex-col">
+          <p className="text-[10px] font-bold uppercase tracking-widest text-white/40 mb-2 px-1">Conversation</p>
+          <div className="flex-grow min-h-0 overflow-y-auto space-y-2 pr-1">
+            {messages.length === 0 && (
+              <p className="text-white/30 text-sm text-center mt-6">The conversation will appear here.</p>
+            )}
+            {messages.map((m, i) => (
+              <div key={i} className={`flex ${m.role === 'tech' ? 'justify-end' : 'justify-start'}`}>
+                <div className={`max-w-[80%] px-3.5 py-2.5 rounded-2xl text-sm leading-snug ${
+                  m.role === 'tech'
+                    ? 'bg-indigo-600 text-white rounded-br-md'
+                    : 'bg-white/10 text-white/90 rounded-bl-md'
+                }`}>
+                  {m.text}
                 </div>
               </div>
-              {status === 'AI Online' && (
-                <div className="flex items-center gap-1">
-                  <span className="w-1.5 h-4 bg-indigo-400 rounded-full animate-[pulse_1s_ease-in-out_infinite]"></span>
-                  <span className="w-1.5 h-6 bg-indigo-500 rounded-full animate-[pulse_1.2s_ease-in-out_infinite]"></span>
-                  <span className="w-1.5 h-3 bg-indigo-400 rounded-full animate-[pulse_0.8s_ease-in-out_infinite]"></span>
-                </div>
+            ))}
+            <div ref={transcriptEndRef} />
+          </div>
+        </div>
+
+        {/* ZONE 4 — Action buttons */}
+        <div className="shrink-0 flex flex-col gap-2.5">
+          {/* Primary row: Hold to speak / Pause / End */}
+          <div className="flex gap-2.5">
+            <button
+              onPointerDown={startTalking}
+              onPointerUp={stopTalking}
+              onPointerLeave={stopTalking}
+              onPointerCancel={stopTalking}
+              onContextMenu={(e) => e.preventDefault()}
+              disabled={status !== 'AI Online' || isPaused}
+              className={`touch-manipulation select-none flex-1 py-4 rounded-2xl font-bold flex flex-col items-center justify-center gap-1 transition-all active:scale-95 ${
+                isHolding
+                  ? 'bg-indigo-500 text-white ring-2 ring-indigo-300 scale-[1.02]'
+                  : 'bg-white/10 text-white hover:bg-white/15'
+              } ${(status !== 'AI Online' || isPaused) ? 'opacity-40 cursor-not-allowed' : ''}`}
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
+              <span className="text-xs">{isHolding ? 'Listening…' : 'Hold to speak'}</span>
+            </button>
+
+            <button
+              onClick={handleTogglePause}
+              className={`touch-manipulation flex-1 py-4 rounded-2xl font-bold flex flex-col items-center justify-center gap-1 transition-all active:scale-95 ${
+                isPaused
+                  ? 'bg-amber-500 text-white hover:bg-amber-400'
+                  : 'bg-white/10 text-white hover:bg-white/15'
+              }`}
+            >
+              {isPaused ? (
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3" /></svg>
+              ) : (
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1" /><rect x="14" y="4" width="4" height="16" rx="1" /></svg>
               )}
-            </div>
+              <span className="text-xs">{isPaused ? 'Resume' : 'Pause'}</span>
+            </button>
+
+            <button
+              onClick={handleFinishJob}
+              disabled={isEnding}
+              className={`touch-manipulation flex-1 py-4 rounded-2xl font-bold flex flex-col items-center justify-center gap-1 transition-all active:scale-95 ${
+                isEnding
+                  ? 'bg-red-500/40 text-white/70 cursor-not-allowed'
+                  : 'bg-white/10 text-white hover:bg-red-500/20'
+              }`}
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+              <span className="text-xs">{isEnding ? 'Closing…' : 'End'}</span>
+            </button>
           </div>
 
-          {/* Action Buttons */}
-          <div className="flex flex-col gap-3 mt-6">
-            
-            {/* MANUAL OVERRIDE BUTTON */}
+          {/* Secondary row: Verify Frame / Complete Audit */}
+          <div className="flex gap-2.5">
             <button
               onClick={handleManualVerify}
-              className="touch-manipulation w-full py-4 rounded-full font-bold shadow-lg transition-all active:scale-95 bg-indigo-600 text-white shadow-indigo-200 hover:bg-indigo-700"
+              disabled={status !== 'AI Online'}
+              className={`touch-manipulation flex-1 py-3 rounded-2xl font-semibold text-sm transition-all active:scale-95 border border-indigo-400/30 text-indigo-300 hover:bg-indigo-500/10 ${
+                status !== 'AI Online' ? 'opacity-40 cursor-not-allowed' : ''
+              }`}
             >
               Verify Frame
             </button>
-
             <button
               onClick={handleCompleteAudit}
               disabled={isEnding}
-              className={`touch-manipulation w-full py-4 rounded-full font-bold shadow-lg transition-all active:scale-95 ${
-                isEnding 
-                  ? 'bg-green-400 text-white shadow-none opacity-75 cursor-not-allowed' 
-                  : 'bg-green-600 text-white shadow-green-200 hover:bg-green-700'
+              className={`touch-manipulation flex-1 py-3 rounded-2xl font-semibold text-sm transition-all active:scale-95 ${
+                isEnding
+                  ? 'bg-emerald-500/40 text-white/70 cursor-not-allowed'
+                  : 'bg-emerald-600 text-white hover:bg-emerald-500 shadow-lg shadow-emerald-900/30'
               }`}
             >
-              {isEnding ? 'Processing...' : 'Complete Audit'}
+              {isEnding ? 'Processing…' : 'Complete Audit'}
             </button>
-            <div className="flex gap-3">
-              <button 
-                onClick={handleTogglePause}
-                className={`touch-manipulation flex-1 py-4 rounded-full border-2 font-bold transition-colors ${
-                  isPaused 
-                    ? 'bg-amber-500 border-amber-500 text-white hover:bg-amber-600' 
-                    : 'border-indigo-100 text-indigo-600 hover:bg-indigo-50'
-                }`}
-              >
-                {isPaused ? 'Resume AI' : 'Pause AI'}
-              </button>
-              <button
-                onClick={handleFinishJob}
-                disabled={isEnding}
-                className={`touch-manipulation flex-1 py-4 rounded-full font-bold shadow-lg transition-all active:scale-95 ${
-                  isEnding 
-                    ? 'bg-indigo-400 text-white shadow-none opacity-75 cursor-not-allowed' 
-                    : 'bg-indigo-600 text-white shadow-indigo-200 hover:bg-indigo-700'
-                }`}
-              >
-                {isEnding ? 'Closing...' : 'End Audit'}
-              </button>
-            </div>
           </div>
-
         </div>
       </div>
     </div>

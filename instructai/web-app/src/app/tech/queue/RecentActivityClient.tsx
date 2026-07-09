@@ -3,6 +3,15 @@
 import { useState } from 'react'
 import Link from 'next/link'
 
+type Job = {
+  id: string
+  address: string
+  router_model: string
+  status?: string
+  job_type?: string | null
+  _type?: string
+}
+
 function getJobTypeBadge(job_type: string | undefined | null) {
   const type = job_type || 'Setup';
   if (type === 'Diagnostic') {
@@ -19,7 +28,7 @@ function getJobTypeBadge(job_type: string | undefined | null) {
   );
 }
 
-export default function RecentActivityClient({ activeWork, unassignedJobs, claimJob }: { activeWork: any[], unassignedJobs: any[], claimJob: any }) {
+export default function RecentActivityClient({ activeWork, unassignedJobs, claimJob }: { activeWork: Job[], unassignedJobs: Job[], claimJob: (jobId: string) => Promise<void> }) {
   const [activeTab, setActiveTab] = useState('All')
 
   // Combine jobs for the queue

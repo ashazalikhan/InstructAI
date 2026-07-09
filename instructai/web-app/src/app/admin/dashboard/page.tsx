@@ -5,6 +5,15 @@ import { useRouter } from 'next/navigation'
 import { createClient } from '@/src/utils/supabase/client'
 import LogoutButton from './logout-button'
 
+type Job = {
+  id: string
+  address: string
+  router_model: string
+  status: string
+  job_type?: string
+  created_at: string
+}
+
 export default function AdminDashboard() {
   const [jobType, setJobType] = useState('Setup')
   const [routerModel, setRouterModel] = useState('TP-Link Archer AX73 (Wi-Fi 6)')
@@ -13,23 +22,35 @@ export default function AdminDashboard() {
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [successMessage, setSuccessMessage] = useState('')
   const [errorMessage, setErrorMessage] = useState('')
-  const [jobs, setJobs] = useState<any[]>([])
+  const [jobs, setJobs] = useState<Job[]>([])
   const router = useRouter()
   const supabase = createClient()
 
   const fetchJobs = async () => {
-    const { data, error } = await supabase
+    const { data } = await supabase
       .from('jobs')
       .select('*')
       .order('created_at', { ascending: false })
-    
+
     if (data) {
-      setJobs(data)
+      setJobs(data as Job[])
     }
   }
 
   useEffect(() => {
-    fetchJobs()
+    // Load the live job list on mount. Defined inline (like the profile page)
+    // so state updates happen inside the async callback, not synchronously.
+    const loadJobs = async () => {
+      const { data } = await supabase
+        .from('jobs')
+        .select('*')
+        .order('created_at', { ascending: false })
+      if (data) {
+        setJobs(data as Job[])
+      }
+    }
+    loadJobs()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -68,9 +89,10 @@ export default function AdminDashboard() {
         setSuccessMessage('')
       }, 5000)
 
-    } catch (err: any) {
+    } catch (err) {
       console.error("Error dispatching job:", err)
-      setErrorMessage(err.message || 'An error occurred while dispatching the job.')
+      const message = err instanceof Error ? err.message : 'An error occurred while dispatching the job.'
+      setErrorMessage(message)
     } finally {
       setIsSubmitting(false)
     }

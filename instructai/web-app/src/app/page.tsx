@@ -87,8 +87,9 @@ export default function LoginPage() {
 
         router.push('/tech/queue')
       }
-    } catch (error: any) {
-      setErrorMsg(error.message || 'An error occurred during authentication')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'An error occurred during authentication'
+      setErrorMsg(message)
     } finally {
       setLoading(false)
     }

@@ -1,7 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  allowedDevOrigins: ['https://ears-conditional-leaves-treated.trycloudflare.com  ']
+  allowedDevOrigins: ['obtained-cookies-replies-grocery.trycloudflare.com']
 };
 
 export default nextConfig;

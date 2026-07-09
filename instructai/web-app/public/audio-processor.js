@@ -1,5 +1,5 @@
 class AudioProcessor extends AudioWorkletProcessor {
-  process(inputs, outputs, parameters) {
+  process(inputs) {
     const input = inputs[0];
     if (input && input.length > 0) {
       const channelData = input[0];
